@@ -74,3 +74,42 @@ Airflow runtime UID/GID.
   Acceptable: the UI is the canonical place to inspect task logs anyway.
 - Resetting the environment requires `docker compose down -v` to also wipe
   the logs volume, which is a slightly heavier reset than deleting a folder.
+
+---
+
+## ADR-003 — Terraform service account with least-privilege roles
+
+**Date:** 2026-05-02
+**Status:** Accepted
+
+### Context
+
+Terraform needs GCP credentials to provision resources. Two options:
+(a) use the developer's user credentials (Application Default Credentials), or
+(b) create a dedicated service account with explicit roles.
+
+### Decision
+
+Create a dedicated `terraform-sa` service account with three roles:
+- `roles/storage.admin` — create and manage GCS buckets
+- `roles/bigquery.admin` — create and manage BigQuery datasets and tables
+- `roles/iam.serviceAccountUser` — required for some Terraform-driven IAM operations
+
+The JSON key is stored at `~/.config/gcloud-keys/terraform-sa-jjs-project-1.json`,
+**outside the repository**, with file permissions `600` (read/write only for the owner).
+The repo's `.gitignore` blocks any `*sa.json` and `*-key.json` patterns as defence-in-depth.
+
+### Consequences
+
+**Positive**
+- Principle of least privilege: Terraform cannot escalate beyond storage and BigQuery.
+- Reproducible: any future CI/CD pipeline mounts the same key with the same scope.
+- Auditable: GCP audit logs distinguish human actions from Terraform actions.
+
+**Negative / accepted trade-offs**
+- The JSON key is a long-lived credential. Best practice would be to rotate it
+  every 90 days or use Workload Identity Federation. For a portfolio project
+  on a personal laptop with budget alerts, this is acceptable; it would not be
+  in a production setting.
+- Local-only: anyone cloning the repo must create their own service account
+  and key. Documented in the README.

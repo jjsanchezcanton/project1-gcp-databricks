@@ -39,3 +39,7 @@ airflow-webserver.pid
 
 # Databricks
 .databricks/
+
+# Extra protection: any json that contains "private_key" should never be committed
+*sa.json
+*-key.json
