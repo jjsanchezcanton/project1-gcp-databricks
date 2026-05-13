@@ -12,7 +12,9 @@ venv/
 *.tfstate.*
 *.tfvars
 .terraform/
-.terraform.lock.hcl
+tfplan
+# NOTE: .terraform.lock.hcl is INTENTIONALLY committed.
+# It pins provider versions for reproducibility across machines.
 
 # GCP credentials
 *-service-account.json
@@ -40,6 +42,6 @@ airflow-webserver.pid
 # Databricks
 .databricks/
 
-# Extra protection: any json that contains "private_key" should never be committed
+# Extra protection: any json that contains private keys should never be committed
 *sa.json
 *-key.json
