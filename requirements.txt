@@ -1,0 +1,6 @@
+# Core Python dependencies for ingestion and data quality
+google-cloud-storage==2.18.2 # GCS official client for Python (read/write buckets)
+google-cloud-bigquery==3.27.0 # BigQuery client
+pandas==2.2.3 #  manipulate and write Parquet
+pyarrow==18.1.0 #  manipulate and write Parquet
+python-dotenv==1.0.1 # reading .env purpose
