@@ -113,3 +113,55 @@ The repo's `.gitignore` blocks any `*sa.json` and `*-key.json` patterns as defen
   in a production setting.
 - Local-only: anyone cloning the repo must create their own service account
   and key. Documented in the README.
+
+---
+
+## ADR-004 — GCS bucket layout: layered + Hive-style partitioning
+
+**Date:** 2026-05-13
+**Status:** Accepted
+
+### Context
+
+The GCS data lake needs a directory layout that:
+(a) separates medallion layers (Bronze, Silver, Gold),
+(b) supports partition pruning by Spark, BigQuery external tables, and Delta Lake,
+(c) scales to multiple taxi types and multiple years of data,
+(d) preserves traceability to the original source filenames.
+
+### Decision
+
+Adopt a layered + Hive-style partitioning scheme:
+
+    gs://<bucket>/<layer>/<dataset>/year=YYYY/month=MM/<file>
+
+Where:
+
+- `<layer>` is one of `bronze`, `silver`, `gold`.
+- `<dataset>` identifies the source (e.g., `yellow_taxi`, `green_taxi`).
+- `year=YYYY/month=MM` are Hive-style partition columns that Spark/BigQuery
+  recognise automatically for partition pruning.
+- File names in Bronze preserve the original source filename for traceability.
+- File names in Silver/Gold follow Spark/Databricks defaults
+  (such as `part-*.snappy.parquet` for plain Parquet, or `_delta_log/`
+  metadata for Delta Lake).
+
+### Consequences
+
+**Positive**
+
+- Engine-friendly: Spark, BigQuery external tables, and Delta Lake all
+  recognise Hive partitioning natively.
+- Predicate pushdown on year/month filters works without code.
+- Layer separation enables per-layer IAM policies and lifecycle rules
+  if needed later.
+- Adding a new taxi type (e.g. `green_taxi`) does not change the layout.
+
+**Negative / accepted trade-offs**
+
+- The layout is opinionated. If the project later needs streaming ingest
+  (where micro-batches do not align to monthly partitions), the layout
+  would need extension (e.g., adding `day=DD` or `hour=HH`).
+- No ingestion timestamp in the path. Audit trail of "when was each
+  partition ingested" lives in Airflow logs and (later) a metadata table,
+  not in the path itself. Acceptable for a batch portfolio project.
