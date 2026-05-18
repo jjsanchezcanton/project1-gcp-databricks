@@ -224,3 +224,62 @@ The script remains idempotent and produces identical observable outcomes.
 - Loss of streaming/in-memory upload capability — we can no longer upload
   a Python in-memory buffer; we must always go through a local file. Not
   currently a constraint.
+
+---
+
+## ADR-006 — Databricks Free Edition storage strategy: develop on Volumes, validate end-to-end on Databricks-on-GCP trial
+
+**Date:** 2026-05-18
+**Status:** Accepted
+
+### Context
+
+The Silver and Gold transformations require Spark on Databricks. The project
+uses Databricks Free Edition for development, which is a fully managed
+serverless environment running in Databricks' own cloud. Free Edition cannot
+mount an external GCS bucket using a customer service account — it has no
+mechanism to receive arbitrary GCP credentials.
+
+Three options were considered:
+
+1. Make the GCS data lake bucket publicly readable so Databricks can read via
+   HTTPS — rejected as a security anti-pattern that contradicts the
+   `public_access_prevention = enforced` policy in Terraform.
+2. Mirror Bronze data into a Databricks Unity Catalog Volume and develop
+   Silver/Gold there — pragmatic, fast, allows progress.
+3. Use signed URLs per read — overengineered for a portfolio project.
+
+### Decision
+
+Adopt a two-phase storage strategy:
+
+**Development phase (Days 4–7).** GCS Bronze remains the authoritative landing
+zone for raw NYC TLC data, ingested by `ingest_to_gcs.py`. A copy of the
+relevant Bronze partitions is uploaded to a Databricks Unity Catalog Volume
+for use by Silver and Gold notebooks during development.
+
+**End-to-end validation phase (Days 8–10).** Activate a short-lived
+Databricks-on-GCP trial workspace, mount the GCS bucket using the existing
+`terraform-sa` service account, and rerun the Silver/Gold notebooks reading
+directly from GCS. Record the demo. Tear down the trial workspace.
+
+### Consequences
+
+**Positive**
+- Unblocks development immediately on Free Edition.
+- Bronze in GCS remains the source of truth; Databricks Volume is a working
+  copy.
+- The final end-to-end run on Databricks-on-GCP demonstrates the production
+  pattern (Spark reading directly from GCS via service account) — a stronger
+  CV bullet than "Databricks reading from its own storage".
+- The bucket retains `public_access_prevention = enforced` throughout.
+
+**Negative / accepted trade-offs**
+- Temporary data duplication: Bronze partitions exist in both GCS and the
+  Databricks Volume during Days 4–7. Bounded by retention; the Volume is
+  cleaned at end of project.
+- The Silver/Gold notebooks need a small change between phases (path
+  prefix). Mitigated by parameterising the input path at the top of each
+  notebook.
+- Free Edition's serverless compute is rate-limited and queue-shared. Slow
+  starts are expected. Documented to set expectations.
