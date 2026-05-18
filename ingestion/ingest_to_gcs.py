@@ -5,6 +5,10 @@ data lake.
 Idempotent: re-runs are safe. If the destination blob already exists with
 the same size, the upload is skipped (override with --force).
 
+Uses `gcloud storage` as the upload mechanism (via subprocess) and the
+google-cloud-storage Python client only for metadata reads. This avoids a
+known hang in the Python client's HTTP layer under WSL2.
+
 Usage:
     python ingestion/ingest_to_gcs.py --year 2024 --month 1 --taxi-type yellow
     python ingestion/ingest_to_gcs.py --year 2024 --month 1 --taxi-type yellow --force
@@ -13,14 +17,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
+import subprocess
 import sys
 from base64 import b64encode
 from pathlib import Path
-from typing import Optional
-
-from google.cloud import storage
-from google.api_core.exceptions import GoogleAPICallError, NotFound
 
 
 # ----- Configuration constants -----
@@ -37,20 +39,50 @@ logging.basicConfig(
 log = logging.getLogger("ingest_to_gcs")
 
 
+def run_gcloud(args: list[str], timeout: float = 300.0) -> subprocess.CompletedProcess:
+    """
+    Run `gcloud ...` and return the completed process. Raises RuntimeError on
+    non-zero exit. stdout/stderr captured for inspection.
+    """
+    cmd = ["gcloud"] + args
+    log.debug("Running: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"gcloud command timed out after {timeout}s: {exc}") from exc
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gcloud failed (exit {result.returncode}):\n"
+            f"  cmd: {' '.join(cmd)}\n"
+            f"  stderr: {result.stderr.strip()}"
+        )
+    return result
+
+
 def build_local_filename(taxi_type: str, year: int, month: int) -> str:
     """Filename pattern published by NYC TLC."""
     return f"{taxi_type}_tripdata_{year:04d}-{month:02d}.parquet"
 
 
-def build_blob_path(taxi_type: str, year: int, month: int, filename: str) -> str:
-    """GCS object path following the layered + Hive-style partitioning scheme."""
-    return f"bronze/{taxi_type}_taxi/year={year:04d}/month={month:02d}/{filename}"
+def build_blob_uri(taxi_type: str, year: int, month: int, filename: str) -> str:
+    """Full gs:// URI following the layered + Hive-style partitioning scheme."""
+    return (
+        f"gs://{BUCKET_NAME}/bronze/{taxi_type}_taxi/"
+        f"year={year:04d}/month={month:02d}/{filename}"
+    )
 
 
 def compute_md5_b64(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     """
     Compute the MD5 of a local file and return it base64-encoded, matching the
-    format that GCS reports in blob.md5_hash.
+    format that GCS reports in object metadata.
     """
     hasher = hashlib.md5()
     with path.open("rb") as f:
@@ -59,72 +91,88 @@ def compute_md5_b64(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return b64encode(hasher.digest()).decode("ascii")
 
 
-def should_skip_upload(
-    bucket: storage.Bucket,
-    blob_path: str,
-    local_size: int,
-    force: bool,
-) -> bool:
+def describe_blob(blob_uri: str) -> dict | None:
     """
-    Decide whether the upload can be skipped because the destination blob is
-    already there and matches the local file size.
+    Return blob metadata as a dict, or None if the blob does not exist.
+    Uses `gcloud storage objects describe --format=json`.
     """
+    try:
+        result = run_gcloud(
+            ["storage", "objects", "describe", blob_uri, "--format=json"],
+            timeout=60.0,
+        )
+    except RuntimeError as exc:
+        # `gcloud storage objects describe` returns non-zero with a clear
+        # "not found" message when the object does not exist. Distinguish.
+        if "not found" in str(exc).lower() or "404" in str(exc):
+            return None
+        raise
+
+    return json.loads(result.stdout)
+
+
+def should_skip_upload(blob_uri: str, local_size: int, force: bool) -> bool:
+    """Decide whether the upload can be skipped because destination matches."""
     if force:
         log.info("Force flag set, will re-upload regardless of existing state")
         return False
 
-    blob = bucket.blob(blob_path)
-    if not blob.exists():
+    log.info("Checking destination: %s", blob_uri)
+    meta = describe_blob(blob_uri)
+    if meta is None:
         return False
 
-    blob.reload()  # populate size, md5, etc.
-    if blob.size == local_size:
+    remote_size = int(meta.get("size", 0))
+    if remote_size == local_size:
         log.info(
             "Destination already exists with matching size (%d bytes); skipping upload",
-            blob.size,
+            remote_size,
         )
         return True
 
     log.warning(
         "Destination exists but size differs (local=%d, remote=%d); will re-upload",
         local_size,
-        blob.size,
+        remote_size,
     )
     return False
 
 
-def upload_with_verification(
-    bucket: storage.Bucket,
-    blob_path: str,
-    local_path: Path,
-) -> None:
+def upload_with_verification(blob_uri: str, local_path: Path) -> None:
     """
-    Upload the file, then read back the blob metadata and verify size and MD5
-    match the local file. Raises RuntimeError on mismatch.
+    Upload via `gcloud storage cp`, then read back metadata via `gcloud storage
+    objects describe` and verify size and MD5 match the local file.
     """
-    blob = bucket.blob(blob_path)
+    log.info("Uploading %s -> %s", local_path, blob_uri)
+    run_gcloud(
+        ["storage", "cp", str(local_path), blob_uri],
+        timeout=600.0,
+    )
 
-    log.info("Uploading %s -> gs://%s/%s", local_path, bucket.name, blob_path)
-    blob.upload_from_filename(str(local_path))
+    meta = describe_blob(blob_uri)
+    if meta is None:
+        raise RuntimeError("Upload appeared to succeed but blob not found on describe")
 
-    blob.reload()
+    remote_size = int(meta.get("size", 0))
+    remote_md5 = meta.get("md5_hash") or meta.get("md5Hash")
+
     local_size = local_path.stat().st_size
     local_md5 = compute_md5_b64(local_path)
 
-    if blob.size != local_size:
+    if remote_size != local_size:
         raise RuntimeError(
-            f"Size mismatch after upload: local={local_size} remote={blob.size}"
+            f"Size mismatch after upload: local={local_size} remote={remote_size}"
         )
 
-    if blob.md5_hash != local_md5:
+    if remote_md5 and remote_md5 != local_md5:
         raise RuntimeError(
-            f"MD5 mismatch after upload: local={local_md5} remote={blob.md5_hash}"
+            f"MD5 mismatch after upload: local={local_md5} remote={remote_md5}"
         )
 
     log.info(
         "Upload verified: size=%d bytes, md5=%s",
-        blob.size,
-        blob.md5_hash,
+        remote_size,
+        remote_md5 or "(not reported)",
     )
 
 
@@ -144,29 +192,18 @@ def ingest_month(taxi_type: str, year: int, month: int, force: bool) -> int:
     local_size = local_path.stat().st_size
     log.info("Local file: %s (%.2f MB)", local_path, local_size / (1024 * 1024))
 
-    try:
-        client = storage.Client()
-        bucket = client.get_bucket(BUCKET_NAME)
-    except NotFound:
-        log.error("Bucket %s not found", BUCKET_NAME)
-        return 1
-    except GoogleAPICallError as exc:
-        log.error("Failed to access bucket: %s", exc)
-        return 1
-
-    blob_path = build_blob_path(taxi_type, year, month, filename)
-
-    if should_skip_upload(bucket, blob_path, local_size, force):
-        log.info("Nothing to do.")
-        return 0
+    blob_uri = build_blob_uri(taxi_type, year, month, filename)
 
     try:
-        upload_with_verification(bucket, blob_path, local_path)
-    except (GoogleAPICallError, RuntimeError) as exc:
-        log.error("Upload failed: %s", exc)
+        if should_skip_upload(blob_uri, local_size, force):
+            log.info("Nothing to do.")
+            return 0
+        upload_with_verification(blob_uri, local_path)
+    except RuntimeError as exc:
+        log.error("%s", exc)
         return 1
 
-    log.info("Done. gs://%s/%s", bucket.name, blob_path)
+    log.info("Done. %s", blob_uri)
     return 0
 
 
