@@ -283,3 +283,94 @@ directly from GCS. Record the demo. Tear down the trial workspace.
   notebook.
 - Free Edition's serverless compute is rate-limited and queue-shared. Slow
   starts are expected. Documented to set expectations.
+
+---
+
+## ADR-007 — Bronze to Silver transformation rules for NYC TLC Yellow Taxi
+
+**Date:** 2026-05-18
+**Status:** Accepted
+
+### Context
+
+Silver layer must be clean, typed, and analytically valid data — not a copy
+of Bronze. Eight design decisions had to be made before writing the
+transformation notebook. The rules below apply to Yellow Taxi data and will
+be revisited if Green Taxi or FHV data is added.
+
+### Decisions
+
+**D1. Column naming.** Normalise all columns to snake_case. Rename
+`tpep_pickup_datetime` and `tpep_dropoff_datetime` to `pickup_datetime` and
+`dropoff_datetime` (the `tpep_` prefix is legacy NYC TLC vendor terminology).
+Rename `PULocationID` to `pickup_location_id`, `DOLocationID` to
+`dropoff_location_id`, `VendorID` to `vendor_id`, `RatecodeID` to
+`ratecode_id`, `Airport_fee` to `airport_fee`.
+
+**D2. Temporal filters (hard drops).**
+- Drop rows where `pickup_datetime` falls outside `[2024-01-01, 2024-02-01)`
+  for the January 2024 partition. The range is parameterised so other months
+  can reuse the notebook.
+- Drop rows where `dropoff_datetime < pickup_datetime`.
+- Drop rows where `dropoff_datetime - pickup_datetime > 6 hours`.
+
+**D3. Numeric outliers (hard drops).**
+- `trip_distance` must satisfy `0 < trip_distance <= 100` (miles).
+- `fare_amount >= 0`.
+- `total_amount >= 0`.
+- `passenger_count` must be `NULL` or in `[1, 6]`.
+
+**D4. NULL handling.**
+- Keep rows where `passenger_count`, `airport_fee`, or `congestion_surcharge`
+  are NULL — these are legitimately optional per vendor.
+- Drop rows where any of `pickup_datetime`, `dropoff_datetime`,
+  `fare_amount`, `total_amount`, `pickup_location_id`,
+  `dropoff_location_id` are NULL — these invalidate the trip record.
+
+**D5. Derived columns.** Add four computed columns at the Silver layer to
+avoid recomputation in Gold:
+- `trip_duration_minutes` (double) — `(dropoff_datetime - pickup_datetime)` in minutes.
+- `pickup_date` (date) — date portion of `pickup_datetime`.
+- `pickup_hour` (int) — hour of day from `pickup_datetime` (0–23).
+- `is_airport_trip` (boolean) — `airport_fee > 0` (NULL-safe, defaults to false).
+
+**D6. Physical partitioning.** Partition Silver by `year` and `month`
+(derived from `pickup_datetime`). Coarser than per-date partitioning;
+matches Bronze layout; keeps partition sizes in the Spark sweet spot.
+
+**D7. Output format and location.** Delta Lake table managed under Unity
+Catalog as `workspace.default.silver_yellow_taxi`. Storage path:
+`/Volumes/workspace/default/project1_silver/yellow_taxi/`.
+
+**D8. Quality metrics reported.** The notebook computes and logs:
+- `total_input_rows`
+- `dropped_invalid_datetime`
+- `dropped_excessive_duration`
+- `dropped_invalid_distance`
+- `dropped_negative_fare`
+- `dropped_null_critical_fields`
+- `dropped_invalid_passenger_count`
+- `total_output_rows`
+- `retention_rate` (= output / input, as a percentage)
+
+Currently logged to notebook output; in a future iteration, persisted to a
+metrics table under `workspace.default.pipeline_quality_metrics`.
+
+### Consequences
+
+**Positive**
+- Every Silver row is analytically valid by construction.
+- Rules are deterministic and reproducible; identical Bronze input always
+  produces identical Silver output.
+- Quality metrics make data loss visible and auditable.
+- Defensible in interview: every filter has a stated reason and a measurable
+  effect.
+
+**Negative / accepted trade-offs**
+- The hard drops will discard some rows that a more sophisticated pipeline
+  might quarantine and review. For this project, dropping is sufficient;
+  a future iteration could route discarded rows to a dead-letter table.
+- The 100-mile cap on trip distance is a heuristic. A real production
+  pipeline would calibrate this against historical distributions.
+- Derived columns increase Silver storage; the cost is negligible at this
+  scale (single-digit MB per monthly partition after compression).
